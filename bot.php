@@ -1,5 +1,4 @@
-function purchase($uid, $pid) {
-    try {
+try {
         return tx(function () use ($uid, $pid) {
             $p = one('SELECT * FROM products WHERE id=? AND active=1', [$pid]);
             if (!$p) throw new BizErr('gone');
@@ -23,14 +22,4 @@ function purchase($uid, $pid) {
                 $refBonus = (int)round(($p['price'] * REF_PERCENT) / 100);
                 if ($refBonus > 0) {
                     q('UPDATE users SET balance=balance+?, ref_earnings=ref_earnings+? WHERE id=?', [$refBonus, $refBonus, $u['referrer_id']]);
-                    send($u['referrer_id'], "💰 You earned " . money($refBonus) . " referral commission from your referral's purchase!");
-                }
-            }
-            
-            return ['order_id' => $orderId, 'content' => $item['content'], 'product_name' => $p['name'], 'price' => $p['price']];
-        });
-    } catch (BizErr $e) {
-        return ['error' => $e->getMessage()];
-    }
-}
-
+          
