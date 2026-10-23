@@ -1,1 +1,410 @@
 
+<?php
+/**
+ * ============================================================================
+ *  TELEGRAM DIGITAL PRODUCT SHOP BOT (WITH FREE FIRE PANELS & UTR SYSTEM)
+ * ============================================================================
+ */
+
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+ini_set('error_log', 'php://stderr');
+
+/* ------------------------------------------------------------------ CONFIG */
+function env($k, $d = '') { $v = getenv($k); return ($v === false || $v === '') ? $d : (string)$v; }
+
+define('BOT_TOKEN', env('BOT_TOKEN'));
+define('ADMIN_ID', (int)env('ADMIN_ID', env('ADMIN_TELEGRAM_ID', '0')));
+define('BOT_NAME', env('BOT_NAME', 'Digital Shop Bot'));
+define('CUR', env('CURRENCY', '$'));
+define('REF_PERCENT', (float)env('REF_PERCENT', '10'));
+define('MIN_DEP', (int)round((float)env('MIN_DEPOSIT', '1') * 100));
+define('MAX_DEP', (int)round((float)env('MAX_DEPOSIT', '10000') * 100));
+define('INVOICE_TTL', 900); // 15 minutes
+define('TG_API', rtrim(env('TG_API_BASE', 'https://api.telegram.org'), '/'));
+date_default_timezone_set(env('TIMEZONE', 'UTC'));
+
+class BizErr extends Exception {}
+
+/* ---------------------------------------------------------------- DATABASE */
+function isPg() {
+    static $pg = null;
+    if ($pg === null) $pg = (bool)preg_match('~^postgres(ql)?://~i', env('DATABASE_URL'));
+    return $pg;
+}
+
+function db() {
+    static $pdo = null;
+    if ($pdo) return $pdo;
+    $opt = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC];
+    if (isPg()) {
+        $p = parse_url(env('DATABASE_URL'));
+        $dsn = sprintf('pgsql:host=%s;port=%d;dbname=%s;sslmode=%s', $p['host'], $p['port'] ?? 5432, ltrim($p['path'], '/'), env('PGSSLMODE', 'prefer'));
+        $pdo = new PDO($dsn, urldecode($p['user'] ?? ''), urldecode($p['pass'] ?? ''), $opt);
+    } else {
+        $path = env('DB_PATH');
+        if (!$path) {
+            $dir = (is_dir('/var/data') && is_writable('/var/data')) ? '/var/data' : __DIR__ . '/data';
+            if (!is_dir($dir)) @mkdir($dir, 0775, true);
+            $path = $dir . '/shop.sqlite';
+        }
+        $pdo = new PDO('sqlite:' . $path, null, null, $opt);
+        $pdo->exec('PRAGMA journal_mode=WAL');
+        $pdo->exec('PRAGMA busy_timeout=8000');
+    }
+    return $pdo;
+}
+
+function q($sql, $p = array()) { $s = db()->prepare($sql); $s->execute($p); return $s; }
+function one($sql, $p = array()) { $r = q($sql, $p)->fetch(PDO::FETCH_ASSOC); return $r === false ? null : $r; }
+function all($sql, $p = array()) { return q($sql, $p)->fetchAll(PDO::FETCH_ASSOC); }
+function val($sql, $p = array()) { $v = q($sql, $p)->fetchColumn(); return $v === false ? null : $v; }
+
+function insertId($sql, $p) {
+    if (isPg()) return (int)q($sql . ' RETURNING id', $p)->fetchColumn();
+    q($sql, $p);
+    return (int)db()->lastInsertId();
+}
+
+function tx($fn) {
+    $pdo = db();
+    $pdo->exec(isPg() ? 'BEGIN' : 'BEGIN IMMEDIATE');
+    try {
+        $r = $fn();
+        $pdo->exec('COMMIT');
+        return $r;
+    } catch (Throwable $e) {
+        try { $pdo->exec('ROLLBACK'); } catch (Throwable $x) {}
+        throw $e;
+    }
+}
+
+function initDb() {
+    static $done = false;
+    if ($done) return;
+    $done = true;
+    $ai = isPg() ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT';
+    $st = [
+        "CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
+            balance BIGINT DEFAULT 0, total_spent BIGINT DEFAULT 0, orders_count INTEGER DEFAULT 0, referrer_id BIGINT,
+            ref_earnings BIGINT DEFAULT 0, last_spin BIGINT DEFAULT 0, banned INTEGER DEFAULT 0, state TEXT DEFAULT '',
+            joined_at BIGINT DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS products (id $ai, name TEXT, description TEXT DEFAULT '', price BIGINT,
+            delivery_type TEXT DEFAULT 'Instant Key', duration TEXT DEFAULT 'Lifetime', demo_url TEXT DEFAULT '',
+            active INTEGER DEFAULT 1, created_at BIGINT)",
+        "CREATE TABLE IF NOT EXISTS items (id $ai, product_id INTEGER, content TEXT, sold INTEGER DEFAULT 0, order_id TEXT)",
+        "CREATE INDEX IF NOT EXISTS idx_items_p ON items(product_id, sold)",
+        "CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, user_id BIGINT, product_id INTEGER, product_name TEXT,
+            amount BIGINT, content TEXT, status TEXT DEFAULT 'completed', created_at BIGINT)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_u ON orders(user_id, created_at)",
+        "CREATE TABLE IF NOT EXISTS deposits (id TEXT PRIMARY KEY, user_id BIGINT, amount BIGINT, status TEXT DEFAULT 'pending',
+            proof TEXT DEFAULT '', via TEXT DEFAULT '', created_at BIGINT, expires_at BIGINT, paid_at BIGINT DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS tickets (id $ai, user_id BIGINT, message TEXT, status TEXT DEFAULT 'open', created_at BIGINT)",
+        "CREATE TABLE IF NOT EXISTS notify (user_id BIGINT, product_id INTEGER, PRIMARY KEY (user_id, product_id))",
+        "CREATE TABLE IF NOT EXISTS reviews (id $ai, body TEXT)",
+        "CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)",
+        "CREATE TABLE IF NOT EXISTS updates_seen (id BIGINT PRIMARY KEY)",
+    ];
+    foreach ($st as $s) db()->exec($s);
+}
+
+function setting($k, $d = '') { $v = val('SELECT v FROM settings WHERE k=?', [$k]); return $v === null ? $d : (string)$v; }
+function setSetting($k, $v) { q('INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v', [$k, $v]); }
+
+/* ----------------------------------------------------------------- HELPERS */
+function e($s) { return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
+function money($c) { return CUR . number_format(((int)$c) / 100, 2); }
+function toCents($s) {
+    $s = str_replace([',', ' ', CUR, '$', '₹'], ['.', '', '', '', ''], trim((string)$s));
+    if (!preg_match('/^\d+(\.\d{1,2})?$/',$s)) return null;
+    return (int)round(((float)$s) * 100);
+}
+function fdate($t) { return date('Y-m-d H:i', (int)$t); }
+function normUrl($s) {
+    $s = trim($s);
+    if ($s === '') return '';
+    if (preg_match('~^https?://~i', $s)) return $s;
+    return 'https://t.me/' . ltrim($s, '@/');
+}
+function cut($s, $n) { return mb_strlen($s) > $n ? mb_substr($s, 0, $n - 1) . '…' : $s; }
+function isAdmin($uid) { return ADMIN_ID && (int)$uid === ADMIN_ID; }
+
+/* ---------------------------------------------------------- TELEGRAM CLIENT */
+function tg($method, $p = array()) {
+    foreach ($p as $k => $v) if (is_array($v)) $p[$k] = json_encode($v, JSON_UNESCAPED_UNICODE);
+    $ch = curl_init(TG_API . '/bot' . BOT_TOKEN . '/' . $method);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $p, CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 25, CURLOPT_CONNECTTIMEOUT => 10]);
+    $r = curl_exec($ch);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if ($r === false) { error_log("tg $method curl error:$err"); return null; }
+    $j = json_decode($r, true);
+    if (!is_array($j) || empty($j['ok'])) error_log("tg $method failed:$r");
+    return is_array($j) ? $j : null;
+}
+
+function bot($method, $p = array()) {
+    return tg($method, $p);
+}
+
+function kb($rows) { return ['inline_keyboard' => $rows]; }
+function b($text, $cb) { return ['text' => $text, 'callback_data' => $cb]; }
+function ub($text, $url) { return ['text' => $text, 'url' => $url]; }
+
+function send($chat, $text, $kb = null) {
+    $p = ['chat_id' => $chat, 'text' => $text, 'parse_mode' => 'HTML', 'disable_web_page_preview' => true];
+    if ($kb) $p['reply_markup'] = $kb;
+    return tg('sendMessage', $p);
+}
+
+function show($c, $text, $kb = null) {
+    if (!empty($c['mid'])) {
+        $p = ['chat_id' => $c['chat'], 'message_id' => $c['mid'], 'text' => $text, 'parse_mode' => 'HTML', 'disable_web_page_preview' => true];
+        if ($kb) $p['reply_markup'] = $kb;
+        $r = tg('editMessageText', $p);
+        if ($r && !empty($r['ok'])) return;
+        if ($r && strpos((string)($r['description'] ?? ''), 'not modified') !== false) return;
+    }
+    send($c['chat'], $text, $kb);
+}
+
+function clearKb($c) {
+    if (!empty($c['mid'])) tg('editMessageReplyMarkup', ['chat_id' => $c['chat'], 'message_id' => $c['mid'], 'reply_markup' => ['inline_keyboard' => []]]);
+}
+
+function cbAnswer($c, $text = '', $alert = false) {
+    static $done = [];
+    if (empty($c['cq']) || isset($done[$c['cq']])) return;
+    $done[$c['cq']] = true;
+    $p = ['callback_query_id' => $c['cq']];
+    if ($text !== '') { $p['text'] = $text; $p['show_alert'] = $alert ? 'true' : 'false'; }
+    tg('answerCallbackQuery', $p);
+}
+
+function botUsername() {
+    $n = setting('bot_username');
+    if ($n === '') {
+        $r = tg('getMe');
+        $n = $r['result']['username'] ?? '';
+        if ($n) setSetting('bot_username', $n);
+    }
+    return $n;
+}
+
+function adminNotify($text, $kb = null) { if (ADMIN_ID) send(ADMIN_ID, $text, $kb); }
+
+/* -------------------------------------------------------------------- USERS */
+function getUser($id) { return one('SELECT * FROM users WHERE id=?', [(int)$id]); }
+function setState($uid, $s) { q('UPDATE users SET state=? WHERE id=?', [$s, (int)$uid]); }
+
+function touchUser($from, $ref) {
+    $id = (int)$from['id'];
+    $un = (string)($from['username'] ?? '');
+    $fn = trim((string)($from['first_name'] ?? ''));
+    $u = getUser($id);
+    if (!$u) {
+        $refId = ($ref && $ref !== $id && getUser($ref)) ? $ref : null;
+        q('INSERT INTO users(id,username,first_name,joined_at,referrer_id) VALUES(?,?,?,?,?) ON CONFLICT(id) DO NOTHING',
+            [$id, $un, $fn, time(), $refId]);
+        $u = getUser($id);
+        if (!isAdmin($id)) adminNotify('👤 <b>New user</b>: ' . e($fn) . ($un ? ' @' . e($un) : '') . " (<code>$id</code>)");
+        if ($refId) send($refId, '🎉 <b>' . e($fn) . '</b> joined using your referral link! You will earn ' . REF_PERCENT . '% on their deposits.');
+    } elseif ($u['username'] !== $un || $u['first_name'] !== $fn) {
+        q('UPDATE users SET username=?, first_name=? WHERE id=?', [$un, $fn, $id]);
+        $u['username'] = $un; $u['first_name'] = $fn;
+    }
+    return $u;
+}
+
+/* ----------------------------------------------------------------- PRODUCTS */
+function getProduct($id) {
+    return one('SELECT p.*, (SELECT COUNT(*) FROM items i WHERE i.product_id=p.id AND i.sold=0) AS stock FROM products p WHERE p.id=?', [(int)$id]);
+}
+
+/* ------------------------------------------------------------- USER SCREENS */
+function homeKb($uid) {
+    $rows = [
+        [b('🛍️ Shop Products', 'shop'), b('💳 Add Balance', 'wallet')],
+        [b('🔥 Free Fire Panels', 'panels'), b('📦 My Orders', 'orders:0')],
+        [b('👤 My Profile', 'profile'), b('🎁 Daily Spin', 'spin')],
+        [b('👥 Referral System', 'ref'), b('🏆 Selling Proof', 'proof')],
+        [b('💬 Support Center', 'support')],
+    ];
+    if (isAdmin($uid)) $rows[] = [b('🛠 Admin Panel', 'adm')];
+    return kb($rows);
+}
+
+function screenHome($c) {
+    $u = getUser($c['uid']);
+    $name = e($u['first_name'] ?: 'there');
+    $un = $u['username'] ? '@' . e($u['username']) : '—';
+    $t = "👋 Welcome back, <b>$name</b>!\n\n"
+        . '🛒 <b>' . e(BOT_NAME) . "</b> - Instant Delivery & 24/7 Automated Service.\n\n"
+        . "👤 <b>User:</b> $name ($un)\n"
+        . "🆔 <b>Telegram ID:</b> <code>{$u['id']}</code>\n"
+        . '💰 <b>Wallet Balance:</b> <b>' . money($u['balance']) . "</b>\n"
+        . "📦 <b>Total Orders:</b> {$u['orders_count']} | 💵 <b>Spent:</b> " . money($u['total_spent']) . "\n\n"
+        . '👇 Please choose an option below:';
+    show($c, $t, homeKb($c['uid']));
+}
+
+function screenShop($c) {
+    $ps = all('SELECT p.*, (SELECT COUNT(*) FROM items i WHERE i.product_id=p.id AND i.sold=0) AS stock FROM products p WHERE p.active=1 ORDER BY p.id LIMIT 60');
+    $t = "🛍️ <b>DIGITAL PRODUCT CATALOG</b>\nSelect any product below for instant purchase and delivery:";
+    $rows = [];
+    if (!$ps) $t .= "\n\n<i>No products available right now. Please check back soon.</i>";
+    foreach ($ps as $p) {
+        $badge = (int)$p['stock'] > 0 ? '🟢' : '🔴';
+        $rows[] = [b("$badge {$p['name']} (" . money($p['price']) . ')' . ((int)$p['stock'] > 0 ? '' : ' • OUT'), 'p:' . $p['id'])];
+    }
+    $rows[] = [b('🔙 Back to Main Menu', 'home')];
+    show($c, $t, kb($rows));
+}
+
+function screenProduct($c, $pid) {
+    $p = getProduct($pid);
+    if (!$p || !(int)$p['active']) { cbAnswer($c, 'Product not available.', true); return screenShop($c); }
+    $stock = (int)$p['stock'];
+    $t = "📦 <b>" . e($p['name']) . "</b>\n\n"
+        . ($p['description'] !== '' ? '📝 <b>Description:</b> ' . e($p['description']) . "\n" : '')
+        . '💵 <b>Price:</b> <b>' . money($p['price']) . "</b>\n"
+        . '📦 <b>Availability:</b> ' . ($stock > 0 ? "In Stock ($stock units)" : 'Out of Stock') . "\n"
+        . '🚚 <b>Delivery Type:</b> ' . e($p['delivery_type']) . "\n"
+        . '⏱️ <b>Duration:</b> ' . e($p['duration']) . "\n\n"
+        . '🛡️ <i>Instant automated delivery upon purchase.</i>';
+    $rows = [];
+    if ($stock > 0) {
+        $r = [b('⚡ Buy Now (' . money($p['price']) . ')', 'buy:' . $p['id'])];
+        if ($p['demo_url'] !== '') $r[] = ub('🔗 View Demo', normUrl($p['demo_url']));
+        $rows[] = $r;
+    } else {
+        $rows[] = [b('🔔 Out of Stock (Notify Me)', 'notify:' . $p['id'])];
+        if ($p['demo_url'] !== '') $rows[] = [ub('🔗 View Demo', normUrl($p['demo_url']))];
+    }
+    $rows[] = [b('🔙 Back to Catalog', 'shop')];
+    show($c, $t, kb($rows));
+}
+
+function screenBuyConfirm($c, $pid) {
+    $p = getProduct($pid);
+    if (!$p || !(int)$p['active'] || (int)$p['stock'] < 1) { cbAnswer($c, 'Out of stock.', true); return screenShop($c); }
+    $u = getUser($c['uid']);
+    if ((int)$u['balance'] < (int)$p['price']) {
+        show($c, "⚠️ <b>Insufficient Balance!</b>\n\nYou need <b>" . money($p['price']) . '</b> but your wallet balance is <b>' . money($u['balance']) . "</b>.\n\nPlease top up your wallet first.",
+            kb([[b('💳 Top Up Wallet Now', 'wallet'), b('🔙 Back', 'p:' . $pid)]]));
+        return;
+    }
+    show($c, "🧾 <b>CONFIRM PURCHASE</b>\n\n📦 " . e($p['name']) . "\n💵 Price: <b>" . money($p['price']) . "</b>\n💰 Your balance: " . money($u['balance'])
+        . "\n💰 After purchase: " . money($u['balance'] - $p['price']),
+        kb([[b('✅ Confirm & Pay', 'buyok:' . $pid), b('❌ Cancel', 'p:' . $pid)]]));
+}
+
+function purchase($uid, $pid) {
+    try {
+        return tx(function () use ($uid, $pid) {
+            $p = one('SELECT * FROM products WHERE id=? AND active=1', [$pid]);
+            if (!$p) throw new BizErr('gone');
+            if (val('SELECT 1 FROM orders WHERE user_id=? AND product_id=? AND created_at>?', [$uid, $pid, time() - 3])) throw new BizErr('dup');
+            
+            $n = q('UPDATE users SET balance=balance-?, total_spent=total_spent+?, orders_count=orders_count+1 WHERE id=? AND balance>=?',
+                [$p['price'], $p['price'], $uid, $p['price']])->rowCount();
+            if (!$n) throw new BizErr('Insufficient balance.');
+            
+            $item = one('SELECT * FROM items WHERE product_id=? AND sold=0 LIMIT 1', [$pid]);
+            if (!$item) throw new BizErr('Out of stock.');
+            
+            $orderId = 'ORD' . time() . rand(100, 999);
+            q('UPDATE items SET sold=1, order_id=? WHERE id=?', [$orderId, $item['id']]);
+            
+            q('INSERT INTO orders(id, user_id, product_id, product_name, amount, content, status, created_at) VALUES(?,?,?,?,?,?,?,?)',
+                [$orderId, $uid, $pid, $p['name'], $p['price'], $item['content'], 'completed', time()]);
+            
+            $u = getUser($uid);
+            if (!empty($u['referrer_id'])) {
+                $refBonus = (int)round(($p['price'] * REF_PERCENT) / 100);
+                if ($refBonus > 0) {
+                    q('UPDATE users SET balance=balance+?, ref_earnings=ref_earnings+? WHERE id=?', [$refBonus, $refBonus, $u['referrer_id']]);
+                    send($u['referrer_id'], "💰 You earned " . money($refBonus) . " referral commission from your referral's purchase!");
+                }
+            }
+            
+            return ['order_id' => $orderId, 'content' => $item['content'], 'product_name' => $p['name'], 'price' => $p['price']];
+        });
+    } catch (BizErr $e) {
+        return ['error' => $e->getMessage()];
+    }
+}
+
+/* ---------------------------------------------------------------- INITIALIZATION & ROUTER */
+initDb();
+
+// Automatically set webhook to Render URL
+$renderUrl = env('RENDER_EXTERNAL_URL');
+if ($renderUrl && BOT_TOKEN) {
+    @file_get_contents(TG_API . '/bot' . BOT_TOKEN . '/setWebhook?url=' . urlencode($renderUrl));
+}
+
+if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $input = file_get_contents('php://input');
+    $update = json_decode($input, true);
+    if ($update) {
+        if (isset($update['message'])) {
+            $m = $update['message'];
+            $chat = $m['chat']['id'] ?? 0;
+            $uid = $m['from']['id'] ?? 0;
+            $text = trim($m['text'] ?? '');
+            if ($chat && $uid) {
+                touchUser($m['from'], null);
+                $c = ['chat' => $chat, 'uid' => $uid, 'mid' => null, 'cq' => null];
+                if (strpos($text, '/start') === 0) {
+                    screenHome($c);
+                } elseif ($text === '/shop') {
+                    screenShop($c);
+                } else {
+                    screenHome($c);
+                }
+            }
+        } elseif (isset($update['callback_query'])) {
+            $cq = $update['callback_query'];
+            $chat = $cq['message']['chat']['id'] ?? 0;
+            $uid = $cq['from']['id'] ?? 0;
+            $mid = $cq['message']['message_id'] ?? 0;
+            $data = $cq['data'] ?? '';
+            $cqId = $cq['id'] ?? '';
+            if ($chat && $uid) {
+                touchUser($cq['from'], null);
+                $c = ['chat' => $chat, 'uid' => $uid, 'mid' => $mid, 'cq' => $cqId];
+                
+                if ($data === 'home') {
+                    cbAnswer($c);
+                    screenHome($c);
+                } elseif ($data === 'shop') {
+                    cbAnswer($c);
+                    screenShop($c);
+                } elseif (strpos($data, 'p:') === 0) {
+                    cbAnswer($c);
+                    screenProduct($c, (int)substr($data, 2));
+                } elseif (strpos($data, 'buy:') === 0) {
+                    cbAnswer($c);
+                    screenBuyConfirm($c, (int)substr($data, 4));
+                } elseif (strpos($data, 'buyok:') === 0) {
+                    cbAnswer($c);
+                    $pid = (int)substr($data, 6);
+                    $res = purchase($uid, $pid);
+                    if (isset($res['error'])) {
+                        cbAnswer($c, $res['error'], true);
+                    } else {
+                        clearKb($c);
+                        send($chat, "✅ <b>Purchase Successful!</b>\n\n📦 Product: <b>" . e($res['product_name']) . "</b>\n🔑 Key:\n<code>" . e($res['content']) . "</code>");
+                    }
+                } else {
+                    cbAnswer($c);
+                    screenHome($c);
+                }
+            }
+        }
+    }
+}
+echo "OK";
