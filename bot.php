@@ -19,7 +19,4 @@ try {
             
             $u = getUser($uid);
             if (!empty($u['referrer_id'])) {
-                $refBonus = (int)round(($p['price'] * REF_PERCENT) / 100);
-                if ($refBonus > 0) {
-                    q('UPDATE users SET balance=balance+?, ref_earnings=ref_earnings+? WHERE id=?', [$refBonus, $refBonus, $u['referrer_id']]);
-          
+                $refBonus = (in
